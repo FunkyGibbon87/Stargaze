@@ -15,6 +15,12 @@
    - loop() never waits: WiFi scan/connect, NTP, page toggle, redraws and clock all run off millis().
    - The HTTPS request runs in its own FreeRTOS task, so loop() stays responsive
      while the download is in progress.
+
+  Flicker-free updates:
+   - Lines that update (clock, last/next update, status, warnings) remember what they
+     last showed and only redraw when the text actually changes.
+   - Text is drawn with a black background so it overwrites the old text in one pass,
+     instead of clearing to black first (which caused the flash).
 */
 
 #include <Arduino.h>
@@ -140,6 +146,15 @@ time_t astroT[MAX_ASTRO];
 int astroSeeing[MAX_ASTRO];
 int astroTransp[MAX_ASTRO];
 int astroCount = 0;
+
+// What each updating line last showed (so we only redraw when it changes)
+char shownClock[8];
+char shownWarn[40];
+char shownLast[64];
+char shownNext[64];
+char shownStatus[64];
+char shownNoData[64];
+uint16_t shownStatusColor = 0;
 
 // ======================= Moon maths =======================
 const double D2R = M_PI / 180.0;
@@ -613,13 +628,36 @@ bool problemText(char* out, size_t n) {
 }
 
 // ======================= Drawing helpers =======================
-// Clears a w x 10 strip and prints one line of size-1 text in it
+// Prints one line of size-1 text in a strip w pixels wide. The text carries its own
+// black background, so it overwrites old text in a single pass (no black flash).
+// Only the space to the right of the new text is cleared, in case it got shorter.
 void drawLine(int x, int y, int w, uint16_t color, const char* txt) {
-  gfx->fillRect(x, y, w, 10, C_BLACK);
   gfx->setTextSize(1);
-  gfx->setTextColor(color);
+  gfx->setTextColor(color, C_BLACK);
   gfx->setCursor(x, y);
   gfx->print(txt);
+  int used = strlen(txt) * 6;           // built-in font: 6 pixels per character
+  if (used < w) gfx->fillRect(x + used, y, w - used, 10, C_BLACK);
+}
+
+// Same as drawLine, but does nothing if this line already shows exactly this text
+void drawIfChanged(int x, int y, int w, uint16_t color, const char* txt,
+                   char* shown, size_t shownSize) {
+  if (strcmp(txt, shown) == 0) return;
+  drawLine(x, y, w, color, txt);
+  strlcpy(shown, txt, shownSize);
+}
+
+// Forget what's on screen, so every updating line redraws next time.
+// Called after the screen is cleared.
+void resetShown() {
+  const char* never = "\x01";            // a value no real line will ever match
+  strlcpy(shownClock,  never, sizeof(shownClock));
+  strlcpy(shownWarn,   never, sizeof(shownWarn));
+  strlcpy(shownLast,   never, sizeof(shownLast));
+  strlcpy(shownNext,   never, sizeof(shownNext));
+  strlcpy(shownStatus, never, sizeof(shownStatus));
+  strlcpy(shownNoData, never, sizeof(shownNoData));
 }
 
 // Grey label with a value next to it
@@ -631,6 +669,14 @@ void drawKV(int x, int y, int valueX, const char* label, const char* value, uint
   gfx->setTextColor(valueColor);
   gfx->setCursor(valueX, y);
   gfx->print(value);
+}
+
+// Just a grey label (its value is drawn separately and updates on its own)
+void drawLabel(int x, int y, const char* label) {
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GREY);
+  gfx->setCursor(x, y);
+  gfx->print(label);
 }
 
 // First hour in the forecast that hasn't finished yet
@@ -657,18 +703,16 @@ void drawHeader() {
   gfx->fillCircle(260, 9, 2, page == 1 ? C_GREY : C_DIM);
 }
 
+// Clock, top right. Only redraws when the minute changes.
 void drawClock() {
-  gfx->fillRect(SCREEN_W - 52, 4, 52, 12, C_BLACK);
+  char buf[8] = "";
   time_t now = time(nullptr);
-  if (now < 1700000000) return;
-  struct tm lt;
-  localtime_r(&now, &lt);
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%02d:%02d", lt.tm_hour, lt.tm_min);
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_GREY);
-  gfx->setCursor(SCREEN_W - 36, 6);
-  gfx->print(buf);
+  if (now >= 1700000000) {
+    struct tm lt;
+    localtime_r(&now, &lt);
+    snprintf(buf, sizeof(buf), "%02d:%02d", lt.tm_hour, lt.tm_min);
+  }
+  drawIfChanged(SCREEN_W - 36, 6, 36, C_GREY, buf, shownClock, sizeof(shownClock));
 }
 
 // ======================= Page 1: graph =======================
@@ -762,17 +806,21 @@ void drawScreen1(int start) {
   }
 }
 
-// Warning strip at the bottom left of page 1 (only shows when something is wrong)
+// Warning strip at the bottom left of page 1 (only shows when something is wrong).
+// Only redraws when the warning changes.
 void drawWarn() {
   char buf[40];
   if (!problemText(buf, sizeof(buf))) buf[0] = 0;
-  drawLine(2, 158, 112, C_AMBER, buf);
+  drawIfChanged(2, 158, 112, C_AMBER, buf, shownWarn, sizeof(shownWarn));
 }
 
 // ======================= Page 2: conditions =======================
-// Rows that change every second or minute: last update, next update, status
+// Values that change every minute or so: last update, next update, status.
+// Each one only redraws when its text changes. The labels are drawn once by drawScreen2().
+const int UPD_VALUE_X = 78;
+const int UPD_VALUE_W = SCREEN_W - UPD_VALUE_X - 4;
+
 void drawUpdateRows() {
-  gfx->fillRect(0, 124, SCREEN_W, SCREEN_H - 124, C_BLACK);
   char buf[64];
   time_t now = time(nullptr);
 
@@ -782,7 +830,7 @@ void drawUpdateRows() {
   int ago = (int)((now - current.fetchedAt) / 60);
   if (ago < 1) snprintf(buf, sizeof(buf), "%02d:%02d (just now)", lt.tm_hour, lt.tm_min);
   else snprintf(buf, sizeof(buf), "%02d:%02d (%d min ago)", lt.tm_hour, lt.tm_min, ago);
-  drawKV(4, 126, 78, "Last update", buf, C_WHITE);
+  drawIfChanged(UPD_VALUE_X, 126, UPD_VALUE_W, C_WHITE, buf, shownLast, sizeof(shownLast));
 
   // Next update
   if (strcmp(cachedStatus, "Updating...") == 0) {
@@ -794,16 +842,23 @@ void drawUpdateRows() {
     if (rem <= 0) snprintf(buf, sizeof(buf), "due now");
     else snprintf(buf, sizeof(buf), "in %d min", (int)((rem + 59999) / 60000));
   }
-  drawKV(4, 139, 78, "Next update", buf, C_WHITE);
+  drawIfChanged(UPD_VALUE_X, 139, UPD_VALUE_W, C_WHITE, buf, shownNext, sizeof(shownNext));
 
   // Status: warning if something is wrong, otherwise WiFi network and signal strength
   char warn[40];
+  uint16_t color;
   if (problemText(warn, sizeof(warn))) {
-    drawLine(4, 153, 312, C_AMBER, warn);
+    strlcpy(buf, warn, sizeof(buf));
+    color = C_AMBER;
   } else {
     snprintf(buf, sizeof(buf), "WiFi: %s  %d dBm", WiFi.SSID().c_str(), (int)WiFi.RSSI());
-    drawLine(4, 153, 312, C_GREY, buf);
+    color = C_GREY;
   }
+  if (color != shownStatusColor) {        // colour changed: force a redraw
+    strlcpy(shownStatus, "\x01", sizeof(shownStatus));
+    shownStatusColor = color;
+  }
+  drawIfChanged(4, 153, 312, color, buf, shownStatus, sizeof(shownStatus));
 }
 
 void drawScreen2(int start) {
@@ -864,12 +919,17 @@ void drawScreen2(int start) {
   drawKV(BX, Y0 + 6 * DY, BV, "Transp", buf, cur.transp >= 1 ? C_WHITE : C_DIM);
 
   gfx->drawFastHLine(4, 120, SCREEN_W - 8, C_DARK);
+
+  // Labels for the update rows (drawn once); their values update separately
+  drawLabel(4, 126, "Last update");
+  drawLabel(4, 139, "Next update");
   drawUpdateRows();
 }
 
 // ======================= Whole-page redraw and "no data yet" =======================
 void drawPage(int start) {
   gfx->fillScreen(C_BLACK);
+  resetShown();                          // screen is blank, so everything must redraw
   drawHeader();
   if (page == 0) drawScreen1(start);
   else drawScreen2(start);
@@ -887,7 +947,7 @@ void drawNoData() {
   } else {
     strlcpy(buf, cachedStatus, sizeof(buf));
   }
-  drawLine(2, 70, 316, C_GREY, buf);
+  drawIfChanged(2, 70, 316, C_GREY, buf, shownNoData, sizeof(shownNoData));
 }
 
 // ======================= Arduino entry points =======================
@@ -898,6 +958,7 @@ void setup() {
 
   if (!gfx->begin()) Serial.println("gfx begin failed");
   gfx->fillScreen(C_BLACK);
+  resetShown();
   drawHeader();
 
   // Dimmed PWM backlight (5 kHz, 8-bit). Switched on after the screen is cleared.
@@ -936,7 +997,8 @@ void loop() {
     needRedraw = true;
   }
 
-  // 4. Once a second: toggle page, slide the 6-hour window, redraw, update clock and status
+  // 4. Once a second: toggle page, slide the 6-hour window, redraw, update clock and status.
+  //    Small items only touch the screen when their text has changed.
   if (ms - lastTick >= 1000) {
     lastTick = ms;
     time_t now = time(nullptr);
