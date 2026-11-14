@@ -3,7 +3,7 @@
 A small desk display that rates the next 6 hours for stargazing, from **0 (terrible)** to **100 (amazing)**.
 Built on a Waveshare ESP32-C6 1.47" LCD board, with a 3D-printed case.
 
-![Case preview](case/case_preview.png)
+![Case preview](case_preview.png)
 
 ## What it shows
 
